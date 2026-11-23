@@ -100,8 +100,29 @@ def parse_instant(value: Any, *, field_name: str) -> str:
 
 
 def minute_datetime(minute: str) -> datetime:
-    """Inverse of :func:`format_minute` (used for window arithmetic)."""
-    return datetime.strptime(minute, MINUTE_FORMAT).replace(tzinfo=timezone.utc)
+    """Inverse of :func:`format_minute` (used for window arithmetic).
+
+    Canonical minute strings are fixed-width (``YYYY-MM-DDTHH:MM:00Z``), so a
+    direct slice parse avoids the locale-aware (and comparatively expensive)
+    :func:`datetime.strptime` on the hot per-receipt path.
+    """
+    try:
+        return datetime(
+            int(minute[0:4]),
+            int(minute[5:7]),
+            int(minute[8:10]),
+            int(minute[11:13]),
+            int(minute[14:16]),
+            tzinfo=timezone.utc,
+        )
+    except (ValueError, IndexError) as exc:
+        # Fall back to the strict parser for any non-canonical input.
+        try:
+            return datetime.strptime(minute, MINUTE_FORMAT).replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            raise ValidationError(f"not a canonical minute string: {minute!r}") from exc
 
 
 def parse_revision(value: Any, *, field_name: str = "revision") -> int:

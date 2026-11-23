@@ -25,7 +25,7 @@ from .domain import (
     UnknownReceipts,
 )
 from .domain import ValidationError as DomainValidationError
-from .engine import new_report_id, reconcile_snapshot, request_document
+from .engine import new_report_id, reconcile_report, request_document
 from .importer import parse_reading_body, parse_receipt_body, parse_upload
 from .schemas import (
     ImportResult,
@@ -42,7 +42,6 @@ from .storage import (
     list_readings,
     list_receipts,
     list_reports,
-    persist_report,
     reports_for_receipt,
 )
 
@@ -59,7 +58,10 @@ DESCRIPTION = """
   2. `drift` — **当时应取 vs 当前最高修订**：列出当时缺行、当时取数后读数换版等。
 * 批量核对固定使用 **同一个已提交快照**，核对期间数仓可继续补录；补录只会体现在下一批。
 * 单批最多 **10,000** 张回执；整批只发一次风速表关联查询，不按回执逐条扫描。
-* 报告（两份清单 + 依据）整体写入 SQLite：失败则不留报告，历史报告可按编号查询。
+  共享同一 (机组, 采样分钟) 的修订轨迹每批只加载/落库一份，分块流式核对，
+  摘要模式下峰值内存只随回执数与本批不同修订行数之和增长。
+* 报告（两份清单 + 依据）整体写入 SQLite：失败则不留报告，历史报告可按编号查询；
+  分页读取时只展开本页条目与依据，入仓/入选标记按各回执自身的打分时刻判定。
 """
 
 
@@ -288,7 +290,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
         description=(
             "对指定回执（或按机组/打分分钟筛选，最多 10,000 条）在同一个已提交快照上核对，"
             "生成 usage / drift 两份清单及依据并整体写入 SQLite；失败不落报告。"
-            "返回的报告可通过 `GET /api/reports/{report_id}` 重新获取。"
+            "核对按固定分块流式落库，共享同一 (机组, 采样分钟) 的修订轨迹只存一份，"
+            "因此即使关闭内联明细（include_items=false），峰值内存也只随回执数与本批"
+            "不同修订行数之和增长。返回的报告可通过 "
+            "`GET /api/reports/{report_id}` 分页重新获取。"
         ),
     )
     def reconcile(
@@ -304,10 +309,11 @@ def create_app(database_path: str | None = None) -> FastAPI:
             description="内联条目上限，默认 200；完整条目用 GET /api/reports/{report_id} 分页获取",
         ),
     ) -> dict[str, Any]:
-        items, snapshot = reconcile_snapshot(db, request)
         report_id = new_report_id()
+        summary = reconcile_report(db, request, report_id)
         request_doc = request_document(request)
-        summary = persist_report(db, items, snapshot, request_doc, report_id)
+        row = get_report_row(db, report_id)
+        snapshot = json.loads(row["snapshot_json"])
         return _detail_payload(
             db,
             summary,

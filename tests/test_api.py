@@ -248,7 +248,7 @@ def test_concurrent_backfill_does_not_change_in_flight_report(client, monkeypatc
 
     original = engine._evaluate
 
-    def evaluate_then_backfill(receipts, pairs):
+    def evaluate_then_backfill(receipts, pairs, pair_index=None):
         client.post(
             "/api/readings",
             json=[
@@ -261,7 +261,7 @@ def test_concurrent_backfill_does_not_change_in_flight_report(client, monkeypatc
                 }
             ],
         )
-        return original(receipts, pairs)
+        return original(receipts, pairs, pair_index)
 
     monkeypatch.setattr(engine, "_evaluate", evaluate_then_backfill)
     first = client.post("/api/reconcile", json={"receipt_ids": ["R-MISSING"]}).json()
@@ -290,7 +290,7 @@ def test_failed_persist_leaves_no_report(client, monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(main_module, "persist_report", boom)
+    monkeypatch.setattr(main_module, "reconcile_report", boom)
     with pytest.raises(RuntimeError, match="disk full"):
         client.post("/api/reconcile", json={"receipt_ids": ["R-OK"]})
     assert client.get("/api/reports").json()["total"] == 0

@@ -69,13 +69,35 @@ CREATE TABLE IF NOT EXISTS report_items (
     evidence_json        TEXT    NOT NULL,
     usage_finding_count  INTEGER NOT NULL,
     drift_finding_count  INTEGER NOT NULL,
+    pair_seq             INTEGER,
     PRIMARY KEY (report_id, seq),
     FOREIGN KEY (report_id) REFERENCES reports (report_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_report_items_receipt
     ON report_items (report_id, receipt_id);
+
+-- One shared ingestion trail per distinct (turbine, sample minute) a report
+-- touches.  Hundreds of receipts referencing the same 400-revision minute no
+-- longer each carry their own 400-row copy of the trail.
+CREATE TABLE IF NOT EXISTS report_pairs (
+    report_id      TEXT    NOT NULL,
+    pair_seq       INTEGER NOT NULL,
+    turbine_id     TEXT    NOT NULL,
+    sample_minute  TEXT    NOT NULL,
+    trail_json     TEXT    NOT NULL,
+    PRIMARY KEY (report_id, pair_seq),
+    FOREIGN KEY (report_id) REFERENCES reports (report_id) ON DELETE CASCADE
+);
 """
+
+#: Columns added after the first release; applied with plain ALTER TABLE so a
+#: pre-existing SQLite volume (created by the old schema) opens unchanged.
+_ADDED_COLUMNS = {
+    "report_items": [
+        ("pair_seq", "INTEGER"),
+    ],
+}
 
 
 class Database:
@@ -135,8 +157,25 @@ class Database:
         conn = self.connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns/tables introduced after the first release in place.
+
+        Old SQLite volumes keep every historical report readable: legacy
+        ``report_items`` rows simply get NULL ``pair_seq`` and their original
+        inline ``evidence_json`` (which still contains the full trail).
+        """
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         if self._keeper is not None:

@@ -377,6 +377,43 @@ def test_one_query_for_all_receipts_regardless_of_batch_size(db):
     assert db.select_count <= 6, db.select_count
 
 
+def test_expected_revision_handles_out_of_order_ingestion(db):
+    # Nothing guarantees a higher revision was ingested later.  The rule is
+    # "highest revision among rows already ingested", not "latest ingested".
+    import_readings(
+        db,
+        [
+            reading("WT", "2026-01-01T10:00:00Z", 1, "2026-01-01T10:30:00Z"),
+            reading("WT", "2026-01-01T10:00:00Z", 2, "2026-01-01T10:20:00Z"),
+            reading("WT", "2026-01-01T10:00:00Z", 3, "2026-01-01T10:10:00Z"),
+        ],
+    )
+    import_receipts(
+        db, [receipt("R1", "WT", "2026-01-01T11:00:00Z", "2026-01-01T10:00:00Z", 3)]
+    )
+    items, _ = run(db, receipt_ids=["R1"])
+    # All three were ingested before the 11:00 score, so rev 3 (highest) was
+    # the "当时应取" and using it is clean.
+    assert items["R1"]["usage"] == []
+    assert items["R1"]["evidence"]["should_use_at_score"]["revision"] == 3
+
+    # A score at 10:15 only had rev 3 available (ingested 10:10); revs 1/2
+    # arrived later despite carrying lower revision numbers.
+    import_receipts(
+        db, [receipt("R2", "WT", "2026-01-01T10:15:00Z", "2026-01-01T10:00:00Z", 3)]
+    )
+    items2, _ = run(db, receipt_ids=["R2"])
+    assert items2["R2"]["evidence"]["should_use_at_score"]["revision"] == 3
+
+    # At 10:05 nothing had been ingested yet -> 缺测, even though all rows
+    # exist in the warehouse now.
+    import_receipts(
+        db, [receipt("R3", "WT", "2026-01-01T10:05:00Z", "2026-01-01T10:00:00Z", 3)]
+    )
+    items3, _ = run(db, receipt_ids=["R3"])
+    assert items3["R3"]["evidence"]["should_use_at_score"]["present"] is False
+
+
 def test_snapshot_is_stable_when_backfill_happens_during_batch(db, monkeypatch):
     """Writes committed mid-batch must not leak into the running snapshot."""
     import_readings(
@@ -389,12 +426,12 @@ def test_snapshot_is_stable_when_backfill_happens_during_batch(db, monkeypatch):
 
     original = engine._evaluate
 
-    def evaluate_and_backfill(receipts, pairs):
+    def evaluate_and_backfill(receipts, pairs, pair_index=None):
         import_readings(
             db,
             [reading("WT", "2026-01-01T10:00:00Z", 2, "2026-01-01T11:30:00Z")],
         )
-        return original(receipts, pairs)
+        return original(receipts, pairs, pair_index)
 
     monkeypatch.setattr(engine, "_evaluate", evaluate_and_backfill)
     items, _ = engine.reconcile_snapshot(db, ReconcileRequest(receipt_ids=["R1"]))

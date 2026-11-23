@@ -23,16 +23,30 @@ Selection rule ("当时应取"):
 * Of those, the one with the **highest revision** is used.
 * If nothing qualifies the expected reading is missing (缺测留空).
 
-No query is issued per receipt: the batch costs O(batch + warehouse rows for
-the touched minutes).
+Memory model
+------------
+
+All receipts of a batch that reference the same (turbine, sample minute)
+share a single :class:`_PairData` object, and eligibility ("already ingested
+by the score minute?") is answered with a binary search over the ordered
+ingestion times rather than by scanning the revision trail per receipt.
+Consequently the working set grows as O(number of receipts + number of
+distinct warehouse revision rows the batch touches) - never as their product.
+
+:func:`reconcile_report` additionally streams the batch in fixed-size chunks
+and persists each chunk before evaluating the next, so generating a report
+with ``include_items=False`` never materialises the full batch (let alone a
+per-receipt copy of every trail) in memory.
 """
 
 from __future__ import annotations
 
+import bisect
+import json
 import sqlite3
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
@@ -56,6 +70,10 @@ WINDOW_START_INCLUSIVE = True
 WINDOW_END_INCLUSIVE = False
 WINDOW_HOURS = 1
 
+#: Receipts evaluated and persisted per streaming chunk.  Bounds the live
+#: working set of a summary-only reconciliation independently of batch size.
+CHUNK_SIZE = 500
+
 
 @dataclass(frozen=True)
 class _Row:
@@ -68,14 +86,50 @@ class _Row:
 class _PairData:
     rows: list[_Row]
     by_revision: dict[int, _Row]
+    # Rows re-ordered by ingestion time (the business rule does not require a
+    # higher revision to have been ingested later), together with the running
+    # maximum revision over that order.  The highest eligible revision at any
+    # cutoff is then the prefix maximum at the cutoff, found in O(log n).
+    ingest_order: list[_Row] = field(default_factory=list)
+    ingest_times: list[str] = field(default_factory=list)
+    prefix_max_revision: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.ingest_order:
+            self.ingest_order = sorted(self.rows, key=lambda row: row.ingested_at)
+            self.ingest_times = [row.ingested_at for row in self.ingest_order]
+            self.prefix_max_revision = []
+            running_max = -1
+            for row in self.ingest_order:
+                running_max = max(running_max, row.revision)
+                self.prefix_max_revision.append(running_max)
 
     @property
     def highest(self) -> _Row | None:
         return self.rows[-1] if self.rows else None
 
+    def expected(self, cutoff: str) -> _Row | None:
+        """Highest revision already ingested strictly before ``cutoff``.
+
+        Correct even when revisions were ingested out of order: eligibility is
+        decided on ingestion time, then the max revision is taken (never a
+        per-receipt scan of the full trail).
+        """
+        count = bisect.bisect_left(self.ingest_times, cutoff)
+        if not count:
+            return None
+        return self.by_revision[self.prefix_max_revision[count - 1]]
+
 
 def _instant_cutoff(score_minute: str) -> str:
-    """The scoring minute as an instant, for a strict ``<`` comparison."""
+    """The scoring minute as an instant, for a strict ``<`` comparison.
+
+    A canonical minute ``YYYY-MM-DDTHH:MM:00Z`` is turned into the fixed-width
+    instant shape by inserting the zero microsecond component, avoiding a
+    datetime round-trip per receipt.
+    """
+    if len(score_minute) == 20 and score_minute.endswith(":00Z"):
+        return score_minute[:19] + ".000000Z"
     return format_instant(minute_datetime(score_minute))
 
 
@@ -239,7 +293,8 @@ def _load_pairs(
     for key, items in grouped.items():
         items.sort(key=lambda item: item.revision)
         result[key] = _PairData(
-            rows=items, by_revision={item.revision: item for item in items}
+            rows=items,
+            by_revision={item.revision: item for item in items},
         )
     return result
 
@@ -387,6 +442,48 @@ def _drift_findings(
     return []
 
 
+def pair_trail(pair: _PairData | None) -> list[dict[str, Any]]:
+    """Shared, receipt-independent ingestion trail for one (turbine, minute).
+
+    The per-receipt flags ``ingested_before_score`` / ``eligible`` are added
+    later by :func:`annotate_evidence`, so the same trail is stored exactly
+    once per report no matter how many receipts reference the pair.
+    """
+    if pair is None:
+        return []
+    return [
+        {
+            "revision": row.revision,
+            "ingested_at": row.ingested_at,
+            "wind_speed": row.wind_speed,
+        }
+        for row in pair.rows
+    ]
+
+
+def annotate_evidence(
+    evidence: dict[str, Any],
+    trail: list[dict[str, Any]],
+    cutoff: str,
+) -> dict[str, Any]:
+    """Attach a revision trail, deriving this receipt's flags per entry.
+
+    ``ingested_before_score`` and ``eligible`` depend on the receipt's own
+    score minute and window, so they are computed at read time rather than
+    shared.  A fresh dict is returned; stored evidence is never mutated.
+    """
+    in_window = bool(evidence["window"]["sample_minute_in_window"])
+    annotated = [
+        {
+            **entry,
+            "ingested_before_score": entry["ingested_at"] < cutoff,
+            "eligible": in_window and entry["ingested_at"] < cutoff,
+        }
+        for entry in trail
+    ]
+    return {**evidence, "revisions": annotated}
+
+
 def _evidence(
     receipt: Receipt,
     actual: _Row | None,
@@ -398,18 +495,6 @@ def _evidence(
     cutoff: str,
 ) -> dict[str, Any]:
     in_window = _in_window(receipt.used_sample_minute, window_start, window_end)
-    trail = []
-    if pair is not None:
-        for row in pair.rows:
-            trail.append(
-                {
-                    "revision": row.revision,
-                    "ingested_at": row.ingested_at,
-                    "wind_speed": row.wind_speed,
-                    "ingested_before_score": row.ingested_at < cutoff,
-                    "eligible": in_window and row.ingested_at < cutoff,
-                }
-            )
     reasons = []
     if not in_window:
         reasons.append(
@@ -461,7 +546,6 @@ def _evidence(
         "current_highest": _side(
             "当前最高修订", current, sample_minute=receipt.used_sample_minute
         ),
-        "revisions": trail,
         "reasons": reasons,
     }
 
@@ -469,22 +553,28 @@ def _evidence(
 def _evaluate(
     receipts: Sequence[Receipt],
     pairs: dict[tuple[str, str], _PairData],
+    pair_index: dict[tuple[str, str], int] | None = None,
 ) -> list[dict[str, Any]]:
+    """Evaluate one chunk of receipts against the pinned snapshot.
+
+    Items carry slim evidence (no revision trail) plus the ``pair_seq`` of
+    their shared trail; the trail itself is stored once per report and
+    re-attached on paginated reads.
+    """
+    if pair_index is None:
+        pair_index = {key: seq for seq, key in enumerate(sorted(pairs))}
     items: list[dict[str, Any]] = []
     for receipt in receipts:
-        pair = pairs.get((receipt.turbine_id, receipt.used_sample_minute))
+        key = (receipt.turbine_id, receipt.used_sample_minute)
+        pair = pairs.get(key)
         cutoff = _instant_cutoff(receipt.score_minute)
         window_start, window_end = _window_bounds(receipt.score_minute)
         in_window = _in_window(
             receipt.used_sample_minute, window_start, window_end
         )
         actual = pair.by_revision.get(receipt.used_revision) if pair else None
-        eligible = (
-            [row for row in pair.rows if row.ingested_at < cutoff]
-            if pair is not None and in_window
-            else []
-        )
-        expected = max(eligible, key=lambda row: row.revision) if eligible else None
+        # O(log revisions): no per-receipt scan of the revision trail.
+        expected = pair.expected(cutoff) if pair is not None and in_window else None
         current = pair.highest if pair else None
         usage = _usage_findings(
             receipt, actual, expected, window_start, window_end, pair, cutoff
@@ -510,19 +600,43 @@ def _evaluate(
                 "usage": usage,
                 "drift": drift,
                 "evidence": evidence,
+                "pair_seq": pair_index.get(key),
             }
         )
     return items
 
 
+def _snapshot_document(conn: sqlite3.Connection, receipt_count: int) -> dict[str, Any]:
+    wind_max_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS max_id FROM wind_readings"
+    ).fetchone()["max_id"]
+    return {
+        "mode": "single_committed_snapshot",
+        "isolation": "SQLite WAL read transaction",
+        "computed_at": format_instant(datetime.now(timezone.utc)),
+        "wind_max_id": int(wind_max_id),
+        "receipt_count": receipt_count,
+        "rule": RULE_TEXT,
+        "window": {
+            "hours": WINDOW_HOURS,
+            "start_inclusive": WINDOW_START_INCLUSIVE,
+            "end_inclusive": WINDOW_END_INCLUSIVE,
+        },
+    }
+
+
 def reconcile_snapshot(
     db: Database, request: ReconcileRequest
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run one batch against a single committed snapshot.
+    """Run one batch against a single committed snapshot (in-memory variant).
 
     A read transaction is opened explicitly and held for the entire batch, so
     every receipt sees the same warehouse state.  Concurrent back-fill writes
     keep working (WAL) and simply land in a later snapshot.
+
+    Returned items keep the historical, fully-expanded shape (including each
+    item's annotated ``revisions`` trail); the HTTP path uses
+    :func:`reconcile_report` instead, which streams and shares trails.
     """
     conn = db.connect()
     committed = False
@@ -530,24 +644,19 @@ def reconcile_snapshot(
         conn.execute("BEGIN")
         try:
             receipts = _load_receipts(conn, request)
-            wind_max_id = conn.execute(
-                "SELECT COALESCE(MAX(id), 0) AS max_id FROM wind_readings"
-            ).fetchone()["max_id"]
+            snapshot = _snapshot_document(conn, len(receipts))
             pairs = _load_pairs(conn, receipts)
-            snapshot = {
-                "mode": "single_committed_snapshot",
-                "isolation": "SQLite WAL read transaction",
-                "computed_at": format_instant(datetime.now(timezone.utc)),
-                "wind_max_id": int(wind_max_id),
-                "receipt_count": len(receipts),
-                "rule": RULE_TEXT,
-                "window": {
-                    "hours": WINDOW_HOURS,
-                    "start_inclusive": WINDOW_START_INCLUSIVE,
-                    "end_inclusive": WINDOW_END_INCLUSIVE,
-                },
-            }
-            items = _evaluate(receipts, pairs)
+            pair_index = {key: seq for seq, key in enumerate(sorted(pairs))}
+            slim_items = _evaluate(receipts, pairs, pair_index)
+            items = []
+            for item in slim_items:
+                key = (item["turbine_id"], item["used_sample_minute"])
+                pair = pairs.get(key)
+                cutoff = item["evidence"]["selection"]["cutoff_instant"]
+                evidence = annotate_evidence(
+                    item["evidence"], pair_trail(pair), cutoff
+                )
+                items.append({**item, "evidence": evidence})
             conn.execute("COMMIT")
             committed = True
         finally:
@@ -559,6 +668,157 @@ def reconcile_snapshot(
     finally:
         conn.close()
     return items, snapshot
+
+
+def reconcile_report(
+    db: Database, request: ReconcileRequest, report_id: str
+) -> dict[str, Any]:
+    """Reconcile a batch and persist the report in streaming chunks.
+
+    The whole batch still reads one committed snapshot (one WAL read
+    transaction held for its duration), but receipts are evaluated and staged
+    :data:`CHUNK_SIZE` at a time: peak memory is O(chunk + receipts + distinct
+    revision rows), independent of how many receipts share one revision trail.
+
+    Staging goes into connection-private TEMP tables, which never take a lock
+    on the main database, so continuous back-fill writes keep committing while
+    the batch runs.  At the end the staged report is copied into the real
+    tables inside one short ``BEGIN IMMEDIATE`` transaction; any failure rolls
+    the complete report back and leaves nothing behind.
+    """
+    from . import storage
+
+    conn = db.connect()
+    read_open = False
+    try:
+        # TEMP tables are connection-private and take no lock on the main
+        # database; create them before opening the snapshot so their DDL does
+        # not implicitly end the read transaction (isolation_level=None).
+        conn.executescript(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS _stage_report (
+                report_id TEXT, created_at TEXT, receipt_count INTEGER,
+                snapshot_json TEXT, request_json TEXT
+            );
+            CREATE TEMP TABLE IF NOT EXISTS _stage_pairs (
+                pair_seq INTEGER, turbine_id TEXT,
+                sample_minute TEXT, trail_json TEXT
+            );
+            CREATE TEMP TABLE IF NOT EXISTS _stage_items (
+                seq INTEGER, receipt_id TEXT, turbine_id TEXT,
+                score_minute TEXT, used_sample_minute TEXT,
+                used_revision INTEGER, usage_json TEXT, drift_json TEXT,
+                evidence_json TEXT, usage_finding_count INTEGER,
+                drift_finding_count INTEGER, pair_seq INTEGER
+            );
+            CREATE TEMP TABLE IF NOT EXISTS _batch_ids (
+                receipt_id TEXT PRIMARY KEY
+            );
+            CREATE TEMP TABLE IF NOT EXISTS _batch_pairs (
+                turbine_id TEXT NOT NULL,
+                sample_minute TEXT NOT NULL,
+                PRIMARY KEY (turbine_id, sample_minute)
+            );
+            """
+        )
+        conn.execute("DELETE FROM _stage_report")
+        conn.execute("DELETE FROM _stage_pairs")
+        conn.execute("DELETE FROM _stage_items")
+        conn.execute("BEGIN")  # snapshot read transaction (WAL)
+        read_open = True
+        receipts = _load_receipts(conn, request)
+        snapshot = _snapshot_document(conn, len(receipts))
+        request_doc = request_document(request)
+        pairs = _load_pairs(conn, receipts)
+        pair_index = {key: seq for seq, key in enumerate(sorted(pairs))}
+        created_at = format_instant(datetime.now(timezone.utc))
+
+        conn.execute(
+            "INSERT INTO _stage_report VALUES (?, ?, ?, ?, ?)",
+            (
+                report_id,
+                created_at,
+                len(receipts),
+                json.dumps(snapshot),
+                json.dumps(request_doc),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO _stage_pairs VALUES (?, ?, ?, ?)",
+            [
+                (
+                    pair_index[key],
+                    key[0],
+                    key[1],
+                    json.dumps(pair_trail(pair)),
+                )
+                for key, pair in sorted(pairs.items(), key=lambda kv: pair_index[kv[0]])
+            ],
+        )
+
+        usage_count = drift_count = items_with_findings = 0
+        seq = 0
+        for start in range(0, len(receipts), CHUNK_SIZE):
+            chunk = receipts[start : start + CHUNK_SIZE]
+            chunk_items = _evaluate(chunk, pairs, pair_index)
+            conn.executemany(
+                "INSERT INTO _stage_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        seq + offset,
+                        item["receipt_id"],
+                        item["turbine_id"],
+                        item["score_minute"],
+                        item["used_sample_minute"],
+                        item["used_revision"],
+                        json.dumps(item["usage"]),
+                        json.dumps(item["drift"]),
+                        json.dumps(item["evidence"]),
+                        len(item["usage"]),
+                        len(item["drift"]),
+                        item.get("pair_seq"),
+                    )
+                    for offset, item in enumerate(chunk_items)
+                ],
+            )
+            seq += len(chunk_items)
+            usage_count += sum(len(item["usage"]) for item in chunk_items)
+            drift_count += sum(len(item["drift"]) for item in chunk_items)
+            items_with_findings += sum(
+                1 for item in chunk_items if item["usage"] or item["drift"]
+            )
+            # chunk_items go out of scope here: the full batch never
+            # accumulates in Python memory (the TEMP tables hold it instead).
+
+        # Snapshot reads are finished; release the read lock before taking the
+        # (short, exclusive) write transaction that publishes the report.
+        conn.execute("COMMIT")
+        read_open = False
+        storage.copy_staged_report(
+            conn,
+            report_id,
+            usage_count=usage_count,
+            drift_count=drift_count,
+            items_with_findings=items_with_findings,
+        )
+    except BaseException:
+        if read_open:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        conn.close()
+    return {
+        "report_id": report_id,
+        "status": "complete",
+        "created_at": created_at,
+        "receipt_count": len(receipts),
+        "usage_finding_count": usage_count,
+        "drift_finding_count": drift_count,
+        "items_with_findings": items_with_findings,
+    }
 
 
 def request_document(request: ReconcileRequest) -> dict[str, Any]:
